@@ -19,6 +19,7 @@ import logging
 import os
 import socket
 
+from keystoneclient import adapter
 import requests
 import six
 from six.moves.urllib import parse
@@ -304,79 +305,95 @@ class HTTPClient(object):
         return self.client_request("PATCH", url, **kwargs)
 
 
-class SessionClient(HTTPClient):
+class SessionClient(adapter.Adapter):
     """HTTP client based on Keystone client session."""
 
-    # NOTE(dhu):  Will eventually move to a common session client.
-    # https://bugs.launchpad.net/python-keystoneclient/+bug/1332337
-    def __init__(self, session, auth, endpoint, **kwargs):
-        self.session = session
-        self.auth = auth
-        self.endpoint = endpoint
+    def __init__(self, session, **kwargs):
+        self.auth_url = kwargs.pop('auth_url', None)
+        self.include_pass = kwargs.pop('include_pass', False)
+        self.username = kwargs.pop('username', None)
+        self.password = kwargs.pop('password', None)
 
-        self.auth_url = kwargs.get('auth_url')
-        self.region_name = kwargs.get('region_name')
-        self.interface = kwargs.get('interface',
-                                    kwargs.get('endpoint_type', 'public'))
-        self.service_type = kwargs.get('service_type')
+        super(SessionClient, self).__init__(session, **kwargs)
 
-        self.include_pass = kwargs.get('include_pass')
-        self.username = kwargs.get('username')
-        self.password = kwargs.get('password')
         # see if we can get the auth_url from auth plugin if one is not
         # provided from kwargs
         if not self.auth_url and hasattr(self.auth, 'auth_url'):
             self.auth_url = self.auth.auth_url
 
-    def _http_request(self, url, method, **kwargs):
-        kwargs.setdefault('user_agent', USER_AGENT)
-        kwargs.setdefault('auth', self.auth)
-
-        endpoint_filter = kwargs.setdefault('endpoint_filter', {})
-        endpoint_filter.setdefault('interface', self.interface)
-        endpoint_filter.setdefault('service_type', self.service_type)
-        endpoint_filter.setdefault('region_name', self.region_name)
+    def request(self, url, method, **kwargs):
+        headers = kwargs.setdefault('headers', {})
 
         # TODO(gyee): what are these headers for?
         if self.auth_url:
-            kwargs['headers'].setdefault('X-Auth-Url', self.auth_url)
+            headers.setdefault('X-Auth-Url', self.auth_url)
         if self.region_name:
-            kwargs['headers'].setdefault('X-Region-Name', self.region_name)
-        if self.include_pass and 'X-Auth-Key' not in kwargs['headers']:
-            kwargs['headers'].update(self.credentials_headers())
+            headers.setdefault('X-Region-Name', self.region_name)
+        if self.include_pass:
+            headers.setdefault('X-Auth-User', self.username)
+            headers.setdefault('X-Auth-Key', self.password)
 
-        # Allow caller to specify not to follow redirects, in which case we
-        # just return the redirect response.  Useful for using stacks:lookup.
         follow_redirects = kwargs.pop('follow_redirects', True)
+        kwargs.setdefault('raise_exc', False)
+        kwargs.setdefault('redirect', follow_redirects)
 
-        # If the endpoint is passed in, make sure keystone uses it
-        # instead of looking up the endpoint in the auth plugin.
-        if self.endpoint:
-            kwargs['endpoint_override'] = self.endpoint
-
-        resp = self.session.request(url, method, redirect=follow_redirects,
-                                    raise_exc=False, **kwargs)
+        resp = super(SessionClient, self).request(url, method, **kwargs)
 
         if 400 <= resp.status_code < 600:
             raise exc.from_response(resp)
-        elif resp.status_code in (301, 302, 305):
-            # Redirected. Reissue the request to the new location,
-            # unless caller specified follow_redirects=False
-            if follow_redirects:
-                location = resp.headers.get('location')
-                path = self.strip_endpoint(location)
-                resp = self._http_request(path, method, **kwargs)
         elif resp.status_code == 300:
             raise exc.from_response(resp)
 
-        return resp
+    def raw_request(self, method, url, **kwargs):
+        headers = kwargs.setdefault('headers', {})
+        headers.setdefault('Content-Type', 'application/octet-stream')
+        return self.request(url, method, **kwargs)
+
+    def json_request(self, method, url, **kwargs):
+        kwargs.setdefault('headers', {})
+        kwargs['headers'].setdefault('Content-Type', 'application/json')
+        kwargs['headers'].setdefault('Accept', 'application/json')
+
+        try:
+            kwargs['json'] = kwargs.get('data')
+        except KeyError:
+            pass
+
+        resp = self.request(url, method, **kwargs)
+        if 'application/json' in resp.headers.get('content-type', ''):
+            try:
+                body = resp.json()
+            except ValueError:
+                LOG.error(_LE('Could not decode response body as JSON'))
+        else:
+            body = None
+
+        return resp, body
+
+    def credentials_headers(self):
+        creds = {}
+        # NOTE(dhu): (shardy) When deferred_auth_method=password, Heat
+        # encrypts and stores username/password.  For Keystone v3, the
+        # intent is to use trusts since SHARDY is working towards
+        # deferred_auth_method=trusts as the default.
+        # TODO(dhu): Make Keystone v3 work in Heat standalone mode.  Maye
+        # require X-Auth-User-Domain.
+        if self.username:
+            creds['X-Auth-User'] = self.username
+        if self.password:
+            creds['X-Auth-Key'] = self.password
+        return creds
 
 
 def _construct_http_client(*args, **kwargs):
     session = kwargs.pop('session', None)
-    auth = kwargs.pop('auth', None)
 
     if session:
-        return SessionClient(session, auth, *args, **kwargs)
+        try:
+            kwargs['interface'] = kwargs.pop('endpoint_type')
+        except KeyError:
+            pass
+
+        return SessionClient(session, **kwargs)
     else:
         return HTTPClient(*args, **kwargs)
