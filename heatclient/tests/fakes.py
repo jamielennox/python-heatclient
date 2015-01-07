@@ -17,10 +17,7 @@ from heatclient.common import http
 from heatclient import exc
 
 
-def script_heat_list(url=None, show_nested=False):
-    if url is None:
-        url = '/stacks?'
-
+def script_heat_list(rm, url, show_nested=False):
     resp_dict = {"stacks": [
         {
             "id": "1",
@@ -48,11 +45,10 @@ def script_heat_list(url=None, show_nested=False):
             "parent": "theparentof3"
         }
         resp_dict["stacks"].append(nested)
-    resp = FakeHTTPResponse(200,
-                            'success, you',
-                            {'content-type': 'application/json'},
-                            jsonutils.dumps(resp_dict))
-    http.HTTPClient.json_request('GET', url).AndReturn((resp, resp_dict))
+
+    rm.get(url,
+           headers={'Content-Type': 'application/json'},
+           json=resp_dict)
 
 
 def mock_script_heat_list(show_nested=False):
@@ -109,7 +105,7 @@ def script_heat_normal_error():
         exc.from_response(resp))
 
 
-def script_heat_error(resp_string):
+def script_heat_error(rm, resp_string):
     resp = FakeHTTPResponse(400,
                             'The resource could not be found',
                             {'content-type': 'application/json'},

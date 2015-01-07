@@ -15,7 +15,6 @@ import fixtures
 import os
 from oslotest import mockpatch
 import re
-import requests
 import six
 from six.moves.urllib import parse
 from six.moves.urllib import request
@@ -33,7 +32,6 @@ from keystoneclient import fixture as keystone_fixture
 
 from mox3 import mox
 
-from heatclient.common import http
 from heatclient.common import utils
 from heatclient import exc
 import heatclient.shell
@@ -47,6 +45,7 @@ BASE_HOST = 'http://keystone.example.com'
 BASE_URL = "%s:5000/" % BASE_HOST
 V2_URL = "%sv2.0" % BASE_URL
 V3_URL = "%sv3" % BASE_URL
+HEAT_URL = 'http://heat.example.com'
 
 
 FAKE_ENV_KEYSTONE_V2 = {
@@ -115,16 +114,25 @@ class TestCase(testtools.TestCase):
         sys.stderr = orig
         return err
 
+    def script_heat_list(self, url=None, **kwargs):
+        if not url:
+            url = '/stacks?'
+
+        return fakes.script_heat_list(self.requests, url, **kwargs)
+
+    def script_heat_error(self, **kwargs):
+        self.requests.get('/stacks/bad', status_code=400, **kwargs)
+
     def register_keystone_v2_token_fixture(self):
         v2_token = keystone_fixture.V2Token(token_id=self.tokenid)
         service = v2_token.add_service('orchestration')
-        service.add_endpoint('http://heat.example.com', region='RegionOne')
+        service.add_endpoint(HEAT_URL, region='RegionOne')
         self.requests.post('%s/tokens' % V2_URL, json=v2_token)
 
     def register_keystone_v3_token_fixture(self):
         v3_token = keystone_fixture.V3Token()
         service = v3_token.add_service('orchestration')
-        service.add_standard_endpoints(public='http://heat.example.com')
+        service.add_standard_endpoints(public=HEAT_URL)
         self.requests.post('%s/auth/tokens' % V3_URL,
                            json=v3_token,
                            headers={'X-Subject-Token': self.tokenid})
@@ -141,6 +149,9 @@ class TestCase(testtools.TestCase):
     def patch(self, target, **kwargs):
         mockfixture = self.useFixture(mockpatch.Patch(target, **kwargs))
         return mockfixture.mock
+
+    def assertJsonEqual(self, json_data, req):
+        self.assertEqual(json_data, jsonutils.loads(req.body))
 
 
 class EnvVarTest(TestCase):
@@ -213,11 +224,6 @@ class ShellParamValidationTest(TestCase):
             err='Malformed parameter')),
     ]
 
-    def setUp(self):
-        super(ShellParamValidationTest, self).setUp()
-        self.m = mox.Mox()
-        self.addCleanup(self.m.VerifyAll)
-        self.addCleanup(self.m.UnsetStubs)
 
     def test_bad_parameters(self):
         self.register_keystone_auth_fixture()
@@ -235,20 +241,11 @@ class ShellParamValidationTest(TestCase):
 
 class ShellValidationTest(TestCase):
 
-    def setUp(self):
-        super(ShellValidationTest, self).setUp()
-        self.m = mox.Mox()
-        self.addCleanup(self.m.VerifyAll)
-        self.addCleanup(self.m.UnsetStubs)
-
     def test_failed_auth(self):
         self.register_keystone_auth_fixture()
-        self.m.StubOutWithMock(http.HTTPClient, 'json_request')
         failed_msg = 'Unable to authenticate user with credentials provided'
-        http.HTTPClient.json_request(
-            'GET', '/stacks?').AndRaise(exc.Unauthorized(failed_msg))
-
-        self.m.ReplayAll()
+        self.requests.get('%s/stacks?' % HEAT_URL,
+                          text=raise_exc_cb(exc.Unauthorized(failed_msg)))
         self.set_fake_env(FAKE_ENV_KEYSTONE_V2)
         self.shell_error('stack-list', failed_msg)
 
@@ -278,8 +275,6 @@ class ShellBase(TestCase):
     def setUp(self):
         super(ShellBase, self).setUp()
         self.m = mox.Mox()
-        self.m.StubOutWithMock(http.HTTPClient, 'json_request')
-        self.m.StubOutWithMock(http.HTTPClient, 'raw_request')
         self.addCleanup(self.m.VerifyAll)
         self.addCleanup(self.m.UnsetStubs)
 
@@ -420,6 +415,13 @@ class ShellTestNoMoxV3(ShellTestNoMox):
         self.set_fake_env(FAKE_ENV_KEYSTONE_V3)
 
 
+def raise_exc_cb(e):
+    def _cb(request, context):
+        raise e
+
+    return _cb
+
+
 class ShellTestCommon(ShellBase):
 
     def setUp(self):
@@ -453,30 +455,24 @@ class ShellTestCommon(ShellBase):
 
     def test_debug_switch_raises_error(self):
         self.register_keystone_auth_fixture()
-        http.HTTPClient.json_request(
-            'GET', '/stacks?').AndRaise(exc.Unauthorized("FAIL"))
-
-        self.m.ReplayAll()
+        self.requests.get('%s/stacks?' % HEAT_URL,
+                          text=raise_exc_cb(exc.Unauthorized("FAIL")))
 
         args = ['--debug', 'stack-list']
         self.assertRaises(exc.Unauthorized, heatclient.shell.main, args)
 
     def test_dash_d_switch_raises_error(self):
         self.register_keystone_auth_fixture()
-        http.HTTPClient.json_request(
-            'GET', '/stacks?').AndRaise(exc.CommandError("FAIL"))
-
-        self.m.ReplayAll()
+        self.requests.get('%s/stacks?' % HEAT_URL,
+                          text=raise_exc_cb(exc.CommandError("FAIL")))
 
         args = ['-d', 'stack-list']
         self.assertRaises(exc.CommandError, heatclient.shell.main, args)
 
     def test_no_debug_switch_no_raises_errors(self):
         self.register_keystone_auth_fixture()
-        http.HTTPClient.json_request(
-            'GET', '/stacks?').AndRaise(exc.Unauthorized("FAIL"))
-
-        self.m.ReplayAll()
+        self.requests.get('%s/stacks?' % HEAT_URL,
+                          text=raise_exc_cb(exc.Unauthorized("FAIL")))
 
         args = ['stack-list']
         self.assertRaises(SystemExit, heatclient.shell.main, args)
@@ -506,9 +502,7 @@ class ShellTestUserPass(ShellBase):
 
     def test_stack_list(self):
         self.register_keystone_auth_fixture()
-        fakes.script_heat_list()
-
-        self.m.ReplayAll()
+        self.script_heat_list()
 
         list_text = self.shell('stack-list')
 
@@ -530,9 +524,7 @@ class ShellTestUserPass(ShellBase):
         expected_url = '/stacks?%s' % parse.urlencode({
             'show_nested': True,
         }, True)
-        fakes.script_heat_list(expected_url, show_nested=True)
-
-        self.m.ReplayAll()
+        self.script_heat_list(expected_url, show_nested=True)
 
         list_text = self.shell('stack-list'
                                ' --show-nested')
@@ -549,8 +541,7 @@ class ShellTestUserPass(ShellBase):
 
     def test_stack_list_show_owner(self):
         self.register_keystone_auth_fixture()
-        fakes.script_heat_list()
-        self.m.ReplayAll()
+        self.script_heat_list()
 
         list_text = self.shell('stack-list --show-owner')
 
@@ -575,9 +566,7 @@ class ShellTestUserPass(ShellBase):
             "title": "Not Found"
         }
 
-        fakes.script_heat_error(jsonutils.dumps(resp_dict))
-
-        self.m.ReplayAll()
+        self.script_heat_error(json=resp_dict)
 
         e = self.assertRaises(exc.HTTPException, self.shell, "stack-show bad")
         self.assertEqual("ERROR: " + message, str(e))
@@ -596,9 +585,7 @@ class ShellTestUserPass(ShellBase):
             "title": "Not Found"
         }
 
-        fakes.script_heat_error(jsonutils.dumps(resp_dict))
-
-        self.m.ReplayAll()
+        self.script_heat_error(json=resp_dict)
 
         exc.verbose = 1
 
@@ -608,8 +595,8 @@ class ShellTestUserPass(ShellBase):
     def test_parsable_malformed_error(self):
         self.register_keystone_auth_fixture()
         invalid_json = "ERROR: {Invalid JSON Error."
-        fakes.script_heat_error(invalid_json)
-        self.m.ReplayAll()
+        self.script_heat_error(text=invalid_json)
+
         e = self.assertRaises(exc.HTTPException, self.shell, "stack-show bad")
         self.assertEqual("ERROR: " + invalid_json, str(e))
 
@@ -625,8 +612,7 @@ class ShellTestUserPass(ShellBase):
             "title": "Not Found"
         }
 
-        fakes.script_heat_error(jsonutils.dumps(missing_message))
-        self.m.ReplayAll()
+        self.script_heat_error(json=missing_message)
 
         e = self.assertRaises(exc.HTTPException, self.shell, "stack-show bad")
         self.assertEqual("ERROR: Internal Error", str(e))
@@ -644,8 +630,7 @@ class ShellTestUserPass(ShellBase):
             "title": "Not Found"
         }
 
-        fakes.script_heat_error(jsonutils.dumps(resp_dict))
-        self.m.ReplayAll()
+        self.script_heat_error(json=resp_dict)
 
         exc.verbose = 1
 
@@ -661,15 +646,9 @@ class ShellTestUserPass(ShellBase):
             "stack_status": 'CREATE_COMPLETE',
             "creation_time": "2012-10-25T01:58:47Z"
         }}
-        resp = fakes.FakeHTTPResponse(
-            200,
-            'OK',
-            {'content-type': 'application/json'},
-            jsonutils.dumps(resp_dict))
-        http.HTTPClient.json_request(
-            'GET', '/stacks/teststack/1').AndReturn((resp, resp_dict))
-
-        self.m.ReplayAll()
+        self.requests.get('/stacks/teststack/1',
+                          headers={'Content-Type': 'application/json'},
+                          json=resp_dict)
 
         list_text = self.shell('stack-show teststack/1')
 
@@ -712,18 +691,13 @@ class ShellTestUserPass(ShellBase):
             }
         }
 
-        resp = fakes.FakeHTTPResponse(
-            200,
-            'OK',
-            {'content-type': 'application/json'},
-            jsonutils.dumps(resp_dict))
-        http.HTTPClient.json_request(
-            'GET', '/stacks/teststack/1').AndReturn((resp, resp_dict))
-        http.HTTPClient.json_request(
-            'DELETE',
-            '/stacks/teststack/1/abandon').AndReturn((resp, abandoned_stack))
+        self.requests.get('/stacks/teststack/1',
+                          headers={'Content-Type': 'application/json'},
+                          json=resp_dict)
+        self.requests.delete('/stacks/teststack/1/abandon',
+                             headers={'Content-Type': 'application/json'},
+                             json=abandoned_stack)
 
-        self.m.ReplayAll()
         abandon_resp = self.shell('stack-abandon teststack/1')
         self.assertEqual(abandoned_stack, jsonutils.loads(abandon_resp))
 
@@ -754,18 +728,12 @@ class ShellTestUserPass(ShellBase):
             }
         }
 
-        resp = fakes.FakeHTTPResponse(
-            200,
-            'OK',
-            {'content-type': 'application/json'},
-            jsonutils.dumps(resp_dict))
-        http.HTTPClient.json_request(
-            'GET', '/stacks/teststack/1').AndReturn((resp, resp_dict))
-        http.HTTPClient.json_request(
-            'DELETE',
-            '/stacks/teststack/1/abandon').AndReturn((resp, abandoned_stack))
-
-        self.m.ReplayAll()
+        self.requests.get('/stacks/teststack/1',
+                          headers={'Content-Type': 'application/json'},
+                          json=resp_dict)
+        self.requests.delete('/stacks/teststack/1/abandon',
+                             headers={'Content-Type': 'application/json'},
+                             json=abandoned_stack)
 
         with tempfile.NamedTemporaryFile() as file_obj:
             self.shell('stack-abandon teststack/1 -O %s' % file_obj.name)
@@ -799,16 +767,9 @@ class ShellTestUserPass(ShellBase):
             "creation_time": "2012-10-25T01:58:47Z"
         }}
 
-        resp = fakes.FakeHTTPResponse(
-            200,
-            'OK',
-            {'content-type': 'application/json'},
-            jsonutils.dumps(resp_dict))
-
-        http.HTTPClient.json_request(
-            'GET', '/stacks/teststack/1').AndReturn((resp, resp_dict))
-
-        self.m.ReplayAll()
+        self.requests.get('/stacks/teststack/1',
+                          headers={'Content-Type': 'application/json'},
+                          json=resp_dict)
 
     def _error_output_fake_response(self):
 
@@ -829,16 +790,9 @@ class ShellTestUserPass(ShellBase):
             "creation_time": "2012-10-25T01:58:47Z"
         }}
 
-        resp = fakes.FakeHTTPResponse(
-            200,
-            'OK',
-            {'content-type': 'application/json'},
-            jsonutils.dumps(resp_dict))
-
-        http.HTTPClient.json_request(
-            'GET', '/stacks/teststack/1').AndReturn((resp, resp_dict))
-
-        self.m.ReplayAll()
+        self.requests.get('/stacks/teststack/1',
+                          headers={'Content-Type': 'application/json'},
+                          json=resp_dict)
 
     def test_output_list(self):
         self.register_keystone_auth_fixture()
@@ -872,16 +826,10 @@ class ShellTestUserPass(ShellBase):
         self.register_keystone_auth_fixture()
         template_data = open(os.path.join(TEST_VAR_DIR,
                                           'minimal.template')).read()
-        resp = fakes.FakeHTTPResponse(
-            200,
-            'OK',
-            {'content-type': 'application/json'},
-            template_data)
-        resp_dict = jsonutils.loads(template_data)
-        http.HTTPClient.json_request(
-            'GET', '/stacks/teststack/template').AndReturn((resp, resp_dict))
 
-        self.m.ReplayAll()
+        self.requests.get('/stacks/teststack/template',
+                          headers={'Content-Type': 'application/json'},
+                          text=template_data)
 
         show_text = self.shell('template-show teststack')
         required = [
@@ -902,15 +850,10 @@ class ShellTestUserPass(ShellBase):
                      "Outputs": {},
                      "Resources": {},
                      "Parameters": {}}
-        resp = fakes.FakeHTTPResponse(
-            200,
-            'OK',
-            {'content-type': 'application/json'},
-            jsonutils.dumps(resp_dict))
-        http.HTTPClient.json_request(
-            'GET', '/stacks/teststack/template').AndReturn((resp, resp_dict))
 
-        self.m.ReplayAll()
+        self.requests.get('/stacks/teststack/template',
+                          headers={'Content-Type': 'application/json'},
+                          json=resp_dict)
 
         show_text = self.shell('template-show teststack')
         required = [
@@ -931,15 +874,10 @@ class ShellTestUserPass(ShellBase):
                      "parameters": {},
                      "resources": {},
                      "outputs": {}}
-        resp = fakes.FakeHTTPResponse(
-            200,
-            'OK',
-            {'content-type': 'application/json'},
-            jsonutils.dumps(resp_dict))
-        http.HTTPClient.json_request(
-            'GET', '/stacks/teststack/template').AndReturn((resp, resp_dict))
 
-        self.m.ReplayAll()
+        self.requests.get('/stacks/teststack/template',
+                          headers={'Content-Type': 'application/json'},
+                          json=resp_dict)
 
         show_text = self.shell('template-show teststack')
         required = [
@@ -962,17 +900,15 @@ class ShellTestUserPass(ShellBase):
             "timeout_mins": timeout,
             "disable_rollback": not(enable_rollback)
         }}
-        resp = fakes.FakeHTTPResponse(
-            200,
-            'OK',
-            {'location': 'http://no.where/v1/tenant_id/stacks/teststack2/2'},
-            jsonutils.dumps(resp_dict))
-        http.HTTPClient.json_request(
-            'POST', '/stacks/preview', data=mox.IgnoreArg(),
-            headers={'X-Auth-Key': 'password', 'X-Auth-User': 'username'}
-        ).AndReturn((resp, resp_dict))
 
-        self.m.ReplayAll()
+        location = 'http://no.where/v1/tenant_id/stacks/teststack2/2'
+
+        self.requests.post('/stacks/preview',
+                           request_headers={'X-Auth-Key': 'password',
+                                            'X-Auth-User': 'username'},
+                           headers={'location': location,
+                                    'Content-Type': 'application/json'},
+                           json=resp_dict)
 
         template_file = os.path.join(TEST_VAR_DIR, 'minimal.template')
         cmd = ('stack-preview teststack '
@@ -1007,18 +943,15 @@ class ShellTestUserPass(ShellBase):
 
     def test_stack_create(self):
         self.register_keystone_auth_fixture()
-        resp = fakes.FakeHTTPResponse(
-            201,
-            'Created',
-            {'location': 'http://no.where/v1/tenant_id/stacks/teststack2/2'},
-            None)
-        http.HTTPClient.json_request(
-            'POST', '/stacks', data=mox.IgnoreArg(),
-            headers={'X-Auth-Key': 'password', 'X-Auth-User': 'username'}
-        ).AndReturn((resp, None))
-        fakes.script_heat_list()
+        location = 'http://no.where/v1/tenant_id/stacks/teststack2/2'
 
-        self.m.ReplayAll()
+        self.script_heat_list()
+        self.requests.post('/stacks',
+                           status_code=201,
+                           request_headers={'X-Auth-Key': 'password',
+                                            'X-Auth-User': 'username'},
+                           headers={'location': location})
+
 
         template_file = os.path.join(TEST_VAR_DIR, 'minimal.template')
         create_text = self.shell(
@@ -1042,11 +975,7 @@ class ShellTestUserPass(ShellBase):
         self.register_keystone_auth_fixture()
         template_file = os.path.join(TEST_VAR_DIR, 'minimal.template')
         template_data = open(template_file).read()
-        resp = fakes.FakeHTTPResponse(
-            201,
-            'Created',
-            {'location': 'http://no.where/v1/tenant_id/stacks/teststack2/2'},
-            None)
+
         expected_data = {
             'files': {},
             'disable_rollback': True,
@@ -1059,13 +988,15 @@ class ShellTestUserPass(ShellBase):
             'environment': {},
             'template': jsonutils.loads(template_data),
             'timeout_mins': 123}
-        http.HTTPClient.json_request(
-            'POST', '/stacks', data=expected_data,
-            headers={'X-Auth-Key': 'password', 'X-Auth-User': 'username'}
-        ).AndReturn((resp, None))
-        fakes.script_heat_list()
+        self.script_heat_list()
 
-        self.m.ReplayAll()
+        location = 'http://no.where/v1/tenant_id/stacks/teststack2/2'
+
+        m = self.requests.post('/stacks',
+                               request_headers={'X-Auth-Key': 'password',
+                                                'X-Auth-User': 'username'},
+                               headers={'location': location},
+                               status_code=201)
 
         create_text = self.shell(
             'stack-create teststack '
@@ -1074,6 +1005,8 @@ class ShellTestUserPass(ShellBase):
             '--parameters="InstanceType=m1.large;DBUsername=wp;'
             'DBPassword=verybadpassword;KeyName=heat_key;'
             'LinuxDistribution=F17"' % template_file)
+
+        self.assertJsonEqual(expected_data, m.last_request)
 
         required = [
             'stack_name',
@@ -1089,11 +1022,6 @@ class ShellTestUserPass(ShellBase):
         self.register_keystone_auth_fixture()
         template_file = os.path.join(TEST_VAR_DIR, 'minimal.template')
         template_data = open(template_file).read()
-        resp = fakes.FakeHTTPResponse(
-            202,
-            'Accepted',
-            {},
-            'The request is accepted for processing.')
 
         expected_data = {
             'files': {},
@@ -1106,14 +1034,14 @@ class ShellTestUserPass(ShellBase):
                            'DBPassword': 'verybadpassword'},
             'timeout_mins': 123,
             'disable_rollback': True}
-        http.HTTPClient.json_request(
-            'PUT', '/stacks/teststack2/2',
-            data=expected_data,
-            headers={'X-Auth-Key': 'password', 'X-Auth-User': 'username'}
-        ).AndReturn((resp, None))
-        fakes.script_heat_list()
 
-        self.m.ReplayAll()
+        self.script_heat_list()
+
+        m = self.requests.put('/stacks/teststack2/2',
+                              status_code=202,
+                              text='The request is accepted for processing.',
+                              request_headers={'X-Auth-Key': 'password',
+                                               'X-Auth-User': 'username'})
 
         update_text = self.shell(
             'stack-update teststack2/2 '
@@ -1123,6 +1051,8 @@ class ShellTestUserPass(ShellBase):
             '--parameters="InstanceType=m1.large;DBUsername=wp;'
             'DBPassword=verybadpassword;KeyName=heat_key;'
             'LinuxDistribution=F17"' % template_file)
+
+        self.assertJsonEqual(expected_data, m.last_request)
 
         required = [
             'stack_name',
@@ -1135,14 +1065,12 @@ class ShellTestUserPass(ShellBase):
 
     def test_stack_create_url(self):
         self.register_keystone_auth_fixture()
-        resp = fakes.FakeHTTPResponse(
-            201,
-            'Created',
-            {'location': 'http://no.where/v1/tenant_id/stacks/teststack2/2'},
-            None)
+
         self.m.StubOutWithMock(request, 'urlopen')
         request.urlopen('http://no.where/minimal.template').AndReturn(
             six.StringIO('{"AWSTemplateFormatVersion" : "2010-09-09"}'))
+
+        self.m.ReplayAll()
 
         expected_data = {
             'files': {},
@@ -1156,13 +1084,14 @@ class ShellTestUserPass(ShellBase):
                            '"InstanceType': 'm1.large',
                            'DBPassword': 'verybadpassword'}}
 
-        http.HTTPClient.json_request(
-            'POST', '/stacks', data=expected_data,
-            headers={'X-Auth-Key': 'password', 'X-Auth-User': 'username'}
-        ).AndReturn((resp, None))
-        fakes.script_heat_list()
+        self.script_heat_list()
 
-        self.m.ReplayAll()
+        location = 'http://no.where/v1/tenant_id/stacks/teststack2/2'
+        m = self.requests.post('/stacks',
+                               status_code=201,
+                               headers={'location': location},
+                               request_headers={'X-Auth-Key': 'password',
+                                                'X-Auth-User': 'username'})
 
         create_text = self.shell(
             'stack-create teststack '
@@ -1170,6 +1099,8 @@ class ShellTestUserPass(ShellBase):
             '--parameters="InstanceType=m1.large;DBUsername=wp;'
             'DBPassword=verybadpassword;KeyName=heat_key;'
             'LinuxDistribution=F17"')
+
+        self.assertJsonEqual(expected_data, m.last_request)
 
         required = [
             'stack_name',
@@ -1184,24 +1115,19 @@ class ShellTestUserPass(ShellBase):
         self.register_keystone_auth_fixture()
         template_file = os.path.join(TEST_VAR_DIR, 'minimal.template')
         template_data = open(template_file).read()
-        http.HTTPClient.raw_request(
-            'GET',
-            'http://no.where/container/minimal.template',
-        ).AndReturn(template_data)
 
-        resp = fakes.FakeHTTPResponse(
-            201,
-            'Created',
-            {'location': 'http://no.where/v1/tenant_id/stacks/teststack2/2'},
-            None)
-        http.HTTPClient.json_request(
-            'POST', '/stacks', data=mox.IgnoreArg(),
-            headers={'X-Auth-Key': 'password', 'X-Auth-User': 'username'}
-        ).AndReturn((resp, None))
+        self.script_heat_list()
 
-        fakes.script_heat_list()
+        self.requests.get('http://no.where/container/minimal.template',
+                          text=template_data)
 
-        self.m.ReplayAll()
+        location = 'http://no.where/v1/tenant_id/stacks/teststack2/2'
+        self.requests.post('/stacks',
+                           status_code=201,
+                           headers={'location': location},
+                           request_headers={'X-Auth-Key': 'password',
+                                            'X-Auth-User': 'username'},
+                           text=template_data)
 
         create_text = self.shell(
             'stack-create teststack2 '
@@ -1221,18 +1147,14 @@ class ShellTestUserPass(ShellBase):
 
     def test_stack_adopt(self):
         self.register_keystone_auth_fixture()
-        resp = fakes.FakeHTTPResponse(
-            201,
-            'Created',
-            {'location': 'http://no.where/v1/tenant_id/stacks/teststack/1'},
-            None)
-        http.HTTPClient.json_request(
-            'POST', '/stacks', data=mox.IgnoreArg(),
-            headers={'X-Auth-Key': 'password', 'X-Auth-User': 'username'}
-        ).AndReturn((resp, None))
-        fakes.script_heat_list()
+        self.script_heat_list()
 
-        self.m.ReplayAll()
+        location = 'http://no.where/v1/tenant_id/stacks/teststack/1'
+        self.requests.post('/stacks',
+                           headers={'location': location},
+                           status_code=201,
+                           request_headers={'X-Auth-Key': 'password',
+                                            'X-Auth-User': 'username'})
 
         adopt_data_file = os.path.join(TEST_VAR_DIR, 'adopt_stack_data.json')
         adopt_text = self.shell(
@@ -1255,7 +1177,6 @@ class ShellTestUserPass(ShellBase):
     def test_stack_adopt_without_data(self):
         self.register_keystone_auth_fixture()
         failed_msg = 'Need to specify --adopt-file'
-        self.m.ReplayAll()
         self.shell_error('stack-adopt teststack ', failed_msg)
 
     def test_stack_update_enable_rollback(self):
@@ -1269,18 +1190,14 @@ class ShellTestUserPass(ShellBase):
                          'disable_rollback': False,
                          'parameters': mox.IgnoreArg()
                          }
-        resp = fakes.FakeHTTPResponse(
-            202,
-            'Accepted',
-            {},
-            'The request is accepted for processing.')
-        http.HTTPClient.json_request(
-            'PUT', '/stacks/teststack2/2',
-            data=expected_data,
-            headers={'X-Auth-Key': 'password', 'X-Auth-User': 'username'}
-        ).AndReturn((resp, None))
-        fakes.script_heat_list()
-        self.m.ReplayAll()
+        self.script_heat_list()
+
+        m = self.requests.put('/stacks/teststack2/2',
+                              status_code=202,
+                              text='The request is accepted for processing.',
+                              request_headers={'X-Auth-Key': 'password',
+                                               'X-Auth-User': 'username'})
+
 
         update_text = self.shell(
             'stack-update teststack2/2 '
@@ -1289,6 +1206,8 @@ class ShellTestUserPass(ShellBase):
             '--parameters="InstanceType=m1.large;DBUsername=wp;'
             'DBPassword=verybadpassword;KeyName=heat_key;'
             'LinuxDistribution=F17"' % template_file)
+
+        self.assertJsonEqual(expected_data, m.last_request)
 
         required = [
             'stack_name',
@@ -1310,18 +1229,13 @@ class ShellTestUserPass(ShellBase):
                          'disable_rollback': True,
                          'parameters': mox.IgnoreArg()
                          }
-        resp = fakes.FakeHTTPResponse(
-            202,
-            'Accepted',
-            {},
-            'The request is accepted for processing.')
-        http.HTTPClient.json_request(
-            'PUT', '/stacks/teststack2',
-            data=expected_data,
-            headers={'X-Auth-Key': 'password', 'X-Auth-User': 'username'}
-        ).AndReturn((resp, None))
-        fakes.script_heat_list()
-        self.m.ReplayAll()
+        self.script_heat_list()
+
+        m = self.requests.put('/stacks/teststack2',
+                              status_code=202,
+                              text='The request is accepted for processing.',
+                              request_headers={'X-Auth-Key': 'password',
+                                               'X-Auth-User': 'username'})
 
         update_text = self.shell(
             'stack-update teststack2 '
@@ -1330,6 +1244,8 @@ class ShellTestUserPass(ShellBase):
             '--parameters="InstanceType=m1.large;DBUsername=wp;'
             'DBPassword=verybadpassword;KeyName=heat_key;'
             'LinuxDistribution=F17"' % template_file)
+
+        self.assertJsonEqual(expected_data, m.last_request)
 
         required = [
             'stack_name',
@@ -1342,7 +1258,6 @@ class ShellTestUserPass(ShellBase):
 
     def test_stack_update_fault_rollback_value(self):
         self.register_keystone_auth_fixture()
-        self.m.ReplayAll()
         template_file = os.path.join(TEST_VAR_DIR, 'minimal.template')
         self.shell_error('stack-update teststack2/2 '
                          '--rollback Foo '
@@ -1360,18 +1275,13 @@ class ShellTestUserPass(ShellBase):
                          'template': template_data,
                          'parameters': mox.IgnoreArg()
                          }
-        resp_update = fakes.FakeHTTPResponse(
-            202,
-            'Accepted',
-            {},
-            'The request is accepted for processing.')
-        http.HTTPClient.json_request(
-            'PUT', '/stacks/teststack2',
-            data=expected_data,
-            headers={'X-Auth-Key': 'password', 'X-Auth-User': 'username'}
-        ).AndReturn((resp_update, None))
-        fakes.script_heat_list()
-        self.m.ReplayAll()
+        self.script_heat_list()
+
+        m = self.requests.put('/stacks/teststack2',
+                              status_code=202,
+                              text='The request is accepted for processing.',
+                              request_headers={'X-Auth-Key': 'password',
+                                               'X-Auth-User': 'username'})
 
         update_text = self.shell(
             'stack-update teststack2 '
@@ -1379,6 +1289,8 @@ class ShellTestUserPass(ShellBase):
             '--parameters="InstanceType=m1.large;DBUsername=wp;'
             'DBPassword=verybadpassword;KeyName=heat_key;'
             'LinuxDistribution=F17"' % template_file)
+
+        self.assertJsonEqual(expected_data, m.last_request)
 
         required = [
             'stack_name',
@@ -1393,31 +1305,28 @@ class ShellTestUserPass(ShellBase):
         self.register_keystone_auth_fixture()
         template_file = os.path.join(TEST_VAR_DIR, 'minimal.template')
         template_data = open(template_file).read()
-        resp = fakes.FakeHTTPResponse(
-            202,
-            'Accepted',
-            {},
-            'The request is accepted for processing.')
         expected_data = {
             'files': {},
             'environment': {},
             'template': jsonutils.loads(template_data),
             'parameters': {},
             'disable_rollback': False}
-        http.HTTPClient.json_request(
-            'PATCH', '/stacks/teststack2/2',
-            data=expected_data,
-            headers={'X-Auth-Key': 'password', 'X-Auth-User': 'username'}
-        ).AndReturn((resp, None))
-        fakes.script_heat_list()
 
-        self.m.ReplayAll()
+        self.script_heat_list()
+
+        m = self.requests.patch('/stacks/teststack2/2',
+                                request_headers={'X-Auth-Key': 'password',
+                                                 'X-Auth-User': 'username'},
+                                status_code=202,
+                                text='The request is accepted for processing.')
 
         update_text = self.shell(
             'stack-update teststack2/2 '
             '--template-file=%s '
             '--enable-rollback '
             '--existing' % template_file)
+
+        self.assertJsonEqual(expected_data, m.last_request)
 
         required = [
             'stack_name',
@@ -1432,25 +1341,20 @@ class ShellTestUserPass(ShellBase):
         self.register_keystone_auth_fixture()
         template_file = os.path.join(TEST_VAR_DIR, 'minimal.template')
         template_data = open(template_file).read()
-        resp = fakes.FakeHTTPResponse(
-            202,
-            'Accepted',
-            {},
-            'The request is accepted for processing.')
         expected_data = {
             'files': {},
             'environment': {},
             'template': jsonutils.loads(template_data),
             'parameters': {'"KeyPairName': 'updated_key"'},
             'disable_rollback': False}
-        http.HTTPClient.json_request(
-            'PATCH', '/stacks/teststack2/2',
-            data=expected_data,
-            headers={'X-Auth-Key': 'password', 'X-Auth-User': 'username'}
-        ).AndReturn((resp, None))
-        fakes.script_heat_list()
 
-        self.m.ReplayAll()
+        self.script_heat_list()
+
+        m = self.requests.patch('/stacks/teststack2/2',
+                                text='The request is accepted for processing.',
+                                status_code=202,
+                                request_headers={'X-Auth-Key': 'password',
+                                                 'X-Auth-User': 'username'})
 
         update_text = self.shell(
             'stack-update teststack2/2 '
@@ -1458,6 +1362,8 @@ class ShellTestUserPass(ShellBase):
             '--enable-rollback '
             '--parameters="KeyPairName=updated_key" '
             '--existing' % template_file)
+
+        self.assertJsonEqual(expected_data, m.last_request)
 
         required = [
             'stack_name',
@@ -1472,11 +1378,6 @@ class ShellTestUserPass(ShellBase):
         self.register_keystone_auth_fixture()
         template_file = os.path.join(TEST_VAR_DIR, 'minimal.template')
         template_data = open(template_file).read()
-        resp = fakes.FakeHTTPResponse(
-            202,
-            'Accepted',
-            {},
-            'The request is accepted for processing.')
         expected_data = {
             'files': {},
             'environment': {},
@@ -1486,14 +1387,14 @@ class ShellTestUserPass(ShellBase):
                                  'DBPassword', 'KeyPairName',
                                  'LinuxDistribution'],
             'disable_rollback': False}
-        http.HTTPClient.json_request(
-            'PATCH', '/stacks/teststack2/2',
-            data=expected_data,
-            headers={'X-Auth-Key': 'password', 'X-Auth-User': 'username'}
-        ).AndReturn((resp, None))
-        fakes.script_heat_list()
 
-        self.m.ReplayAll()
+        self.script_heat_list()
+
+        m = self.requests.patch('/stacks/teststack2/2',
+                                status_code=202,
+                                text='The request is accepted for processing.',
+                                request_headers={'X-Auth-Key': 'password',
+                                                 'X-Auth-User': 'username'})
 
         update_text = self.shell(
             'stack-update teststack2/2 '
@@ -1505,6 +1406,8 @@ class ShellTestUserPass(ShellBase):
             '--clear-parameter=DBPassword '
             '--clear-parameter=KeyPairName '
             '--clear-parameter=LinuxDistribution' % template_file)
+
+        self.assertJsonEqual(expected_data, m.last_request)
 
         required = [
             'stack_name',
@@ -1519,11 +1422,6 @@ class ShellTestUserPass(ShellBase):
         self.register_keystone_auth_fixture()
         template_file = os.path.join(TEST_VAR_DIR, 'minimal.template')
         template_data = open(template_file).read()
-        resp = fakes.FakeHTTPResponse(
-            202,
-            'Accepted',
-            {},
-            'The request is accepted for processing.')
         expected_data = {
             'files': {},
             'environment': {},
@@ -1533,14 +1431,14 @@ class ShellTestUserPass(ShellBase):
                                  'DBPassword', 'KeyPairName',
                                  'LinuxDistribution'],
             'disable_rollback': False}
-        http.HTTPClient.json_request(
-            'PATCH', '/stacks/teststack2/2',
-            data=expected_data,
-            headers={'X-Auth-Key': 'password', 'X-Auth-User': 'username'}
-        ).AndReturn((resp, None))
-        fakes.script_heat_list()
 
-        self.m.ReplayAll()
+        self.script_heat_list()
+
+        m = self.requests.patch('/stacks/teststack2/2',
+                                status_code=202,
+                                text='The request is accepted for processing.',
+                                request_headers={'X-Auth-Key': 'password',
+                                                 'X-Auth-User': 'username'})
 
         update_text = self.shell(
             'stack-update teststack2/2 '
@@ -1554,6 +1452,8 @@ class ShellTestUserPass(ShellBase):
             '--clear-parameter=KeyPairName '
             '--clear-parameter=LinuxDistribution' % template_file)
 
+        self.assertJsonEqual(expected_data, m.last_request)
+
         required = [
             'stack_name',
             'id',
@@ -1566,20 +1466,15 @@ class ShellTestUserPass(ShellBase):
     def test_stack_cancel_update(self):
         self.register_keystone_auth_fixture()
         expected_data = {'cancel_update': None}
-        resp = fakes.FakeHTTPResponse(
-            202,
-            'Accepted',
-            {},
-            'The request is accepted for processing.')
-        http.HTTPClient.json_request(
-            'POST', '/stacks/teststack2/actions',
-            data=expected_data
-        ).AndReturn((resp, None))
-        fakes.script_heat_list()
+        self.script_heat_list()
 
-        self.m.ReplayAll()
+        m = self.requests.post('/stacks/teststack2/actions',
+                               status_code=202,
+                               text='The request is accepted for processing.')
 
         update_text = self.shell('stack-cancel-update teststack2')
+
+        self.assertJsonEqual(expected_data, m.last_request)
 
         required = [
             'stack_name',
@@ -1593,20 +1488,15 @@ class ShellTestUserPass(ShellBase):
     def test_stack_check(self):
         self.register_keystone_auth_fixture()
         expected_data = {'check': None}
-        resp = fakes.FakeHTTPResponse(
-            202,
-            'Accepted',
-            {},
-            'The request is accepted for processing.')
-        http.HTTPClient.json_request(
-            'POST', '/stacks/teststack2/actions',
-            data=expected_data
-        ).AndReturn((resp, None))
-        fakes.script_heat_list()
+        self.script_heat_list()
 
-        self.m.ReplayAll()
+        m = self.requests.post('/stacks/teststack2/actions',
+                               status_code=202,
+                               text='The request is accepted for processing.')
 
         check_text = self.shell('action-check teststack2')
+
+        self.assertJsonEqual(expected_data, m.last_request)
 
         required = [
             'stack_name',
@@ -1619,17 +1509,10 @@ class ShellTestUserPass(ShellBase):
 
     def test_stack_delete(self):
         self.register_keystone_auth_fixture()
-        resp = fakes.FakeHTTPResponse(
-            204,
-            'No Content',
-            {},
-            None)
-        http.HTTPClient.raw_request(
-            'DELETE', '/stacks/teststack2/2',
-        ).AndReturn((resp, None))
-        fakes.script_heat_list()
+        self.script_heat_list()
 
-        self.m.ReplayAll()
+        self.requests.delete('/stacks/teststack2/2',
+                             status_code=204)
 
         delete_text = self.shell('stack-delete teststack2/2')
 
@@ -1644,20 +1527,10 @@ class ShellTestUserPass(ShellBase):
 
     def test_stack_delete_multiple(self):
         self.register_keystone_auth_fixture()
-        resp = fakes.FakeHTTPResponse(
-            204,
-            'No Content',
-            {},
-            None)
-        http.HTTPClient.raw_request(
-            'DELETE', '/stacks/teststack1/1',
-        ).AndReturn((resp, None))
-        http.HTTPClient.raw_request(
-            'DELETE', '/stacks/teststack2/2',
-        ).AndReturn((resp, None))
-        fakes.script_heat_list()
+        self.script_heat_list()
 
-        self.m.ReplayAll()
+        self.requests.delete('/stacks/teststack1/1', status_code=204)
+        self.requests.delete('/stacks/teststack2/2', status_code=204)
 
         delete_text = self.shell('stack-delete teststack1/1 teststack2/2')
 
@@ -1678,13 +1551,10 @@ class ShellTestUserPass(ShellBase):
                 'engine': {'revision': 'engine_revision'}
             }
         }
-        resp_string = jsonutils.dumps(resp_dict)
-        headers = {'content-type': 'application/json'}
-        http_resp = fakes.FakeHTTPResponse(200, 'OK', headers, resp_string)
-        response = (http_resp, resp_dict)
-        http.HTTPClient.json_request('GET', '/build_info').AndReturn(response)
 
-        self.m.ReplayAll()
+        self.requests.get('/build_info',
+                          headers={'Content-Type': 'application/json'},
+                          json=resp_dict)
 
         build_info_text = self.shell('build-info')
 
@@ -1713,19 +1583,13 @@ class ShellTestUserPass(ShellBase):
             "creation_time": "2012-10-25T01:58:47Z"
         }}
 
-        resp = fakes.FakeHTTPResponse(
-            200,
-            'OK',
-            {'content-type': 'application/json'},
-            jsonutils.dumps(resp_dict))
-        http.HTTPClient.json_request(
-            'GET', '/stacks/teststack/1').AndReturn((resp, stack_dict))
-        http.HTTPClient.json_request(
-            'POST',
-            '/stacks/teststack/1/snapshots',
-            data={}).AndReturn((resp, resp_dict))
+        self.requests.get('/stacks/teststack/1',
+                          headers={'Content-Type': 'application/json'},
+                          json=stack_dict)
+        self.requests.post('/stacks/teststack/1/snapshots',
+                          headers={'Content-Type': 'application/json'},
+                          json=resp_dict)
 
-        self.m.ReplayAll()
         resp = self.shell('stack-snapshot teststack/1')
         self.assertEqual(resp_dict, jsonutils.loads(resp))
 
@@ -1744,18 +1608,13 @@ class ShellTestUserPass(ShellBase):
             "creation_time": "2012-10-25T01:58:47Z"
         }}
 
-        resp = fakes.FakeHTTPResponse(
-            200,
-            'OK',
-            {'content-type': 'application/json'},
-            jsonutils.dumps(resp_dict))
-        http.HTTPClient.json_request(
-            'GET', '/stacks/teststack/1').AndReturn((resp, stack_dict))
-        http.HTTPClient.json_request(
-            'GET',
-            '/stacks/teststack/1/snapshots/2').AndReturn((resp, resp_dict))
+        self.requests.get('/stacks/teststack/1',
+                          headers={'Content-Type': 'application/json'},
+                          json=stack_dict)
+        self.requests.get('/stacks/teststack/1/snapshots/2',
+                          headers={'Content-Type': 'application/json'},
+                          json=resp_dict)
 
-        self.m.ReplayAll()
         resp = self.shell('snapshot-show teststack/1 2')
         self.assertEqual(resp_dict, jsonutils.loads(resp))
 
@@ -1774,18 +1633,15 @@ class ShellTestUserPass(ShellBase):
             "creation_time": "2012-10-25T01:58:47Z"
         }}
 
-        resp = fakes.FakeHTTPResponse(
-            204,
-            'No Content',
-            {},
-            None)
-        http.HTTPClient.json_request(
-            'GET', '/stacks/teststack/1').AndReturn((resp, stack_dict))
-        http.HTTPClient.json_request(
-            'DELETE',
-            '/stacks/teststack/1/snapshots/2').AndReturn((resp, resp_dict))
+        self.requests.get('/stacks/teststack/1',
+                          status_code=204,
+                          headers={'Content-Type': 'application/json'},
+                          json=stack_dict)
+        self.requests.delete('/stacks/teststack/1/snapshots/2',
+                             status_code=204,
+                             headers={'Content-Type': 'application/json'},
+                             json=resp_dict)
 
-        self.m.ReplayAll()
         resp = self.shell('snapshot-delete teststack/1 2')
         self.assertEqual("", resp)
 
@@ -1799,18 +1655,12 @@ class ShellTestUserPass(ShellBase):
             "creation_time": "2012-10-25T01:58:47Z"
         }}
 
-        resp = fakes.FakeHTTPResponse(
-            204,
-            'No Content',
-            {},
-            None)
-        http.HTTPClient.json_request(
-            'GET', '/stacks/teststack/1').AndReturn((resp, stack_dict))
-        http.HTTPClient.json_request(
-            'POST',
-            '/stacks/teststack/1/snapshots/2/restore').AndReturn((resp, {}))
+        self.requests.get('/stacks/teststack/1',
+                          json=stack_dict,
+                          headers={'Content-Type': 'application/json'})
+        url = '/stacks/teststack/1/snapshots/2/restore'
+        self.requests.post(url, status_code=204, json={})
 
-        self.m.ReplayAll()
         resp = self.shell('stack-restore teststack/1 2')
         self.assertEqual("", resp)
 
@@ -1833,18 +1683,13 @@ class ShellTestUserPass(ShellBase):
             "creation_time": "2014-12-05T01:25:52Z"
         }]}
 
-        resp = fakes.FakeHTTPResponse(
-            200,
-            'OK',
-            {'content-type': 'application/json'},
-            jsonutils.dumps(resp_dict))
-        http.HTTPClient.json_request(
-            'GET', '/stacks/teststack/1').AndReturn((resp, stack_dict))
-        http.HTTPClient.json_request(
-            'GET',
-            '/stacks/teststack/1/snapshots').AndReturn((resp, resp_dict))
+        self.requests.get('/stacks/teststack/1',
+                          headers={'Content-Type': 'application/json'},
+                          json=stack_dict)
+        self.requests.get('/stacks/teststack/1/snapshots',
+                          headers={'Content-Type': 'application/json'},
+                          json=resp_dict)
 
-        self.m.ReplayAll()
         list_text = self.shell('snapshot-list teststack/1')
 
         required = [
@@ -1907,20 +1752,17 @@ class ShellTestEvents(ShellBase):
                       "resource_name": "aResource",
                       "resource_status": "CREATE_COMPLETE",
                       "resource_status_reason": "state changed"}]}
-        resp = fakes.FakeHTTPResponse(
-            200,
-            'OK',
-            {'content-type': 'application/json'},
-            jsonutils.dumps(resp_dict))
+
         stack_id = 'teststack/1'
         resource_name = 'testresource/1'
-        http.HTTPClient.json_request(
-            'GET', '/stacks/%s/resources/%s/events' % (
-                parse.quote(stack_id, ''),
-                parse.quote(encodeutils.safe_encode(
-                    resource_name), ''))).AndReturn((resp, resp_dict))
 
-        self.m.ReplayAll()
+        url = '/stacks/%s/resources/%s/events' % (
+            parse.quote(stack_id, ''),
+            parse.quote(encodeutils.safe_encode(resource_name), ''))
+
+        self.requests.get(url,
+                          headers={'Content-Type': 'application/json'},
+                          json=resp_dict)
 
         event_list_text = self.shell('event-list {0} --resource {1}'.format(
                                      stack_id, resource_name))
@@ -1963,23 +1805,19 @@ class ShellTestEvents(ShellBase):
                       "resource_status_reason": "state changed",
                       "resource_type": "OS::Nova::Server"
                       }}
-        resp = fakes.FakeHTTPResponse(
-            200,
-            'OK',
-            {'content-type': 'application/json'},
-            jsonutils.dumps(resp_dict))
+
         stack_id = 'teststack/1'
         resource_name = 'testresource/1'
-        http.HTTPClient.json_request(
-            'GET', '/stacks/%s/resources/%s/events/%s' %
-            (
-                parse.quote(stack_id, ''),
-                parse.quote(encodeutils.safe_encode(
-                    resource_name), ''),
-                parse.quote(self.event_id_one, '')
-            )).AndReturn((resp, resp_dict))
 
-        self.m.ReplayAll()
+        url = '/stacks/%s/resources/%s/events/%s' % (
+            parse.quote(stack_id, ''),
+            parse.quote(encodeutils.safe_encode(resource_name), ''),
+            parse.quote(self.event_id_one, '')
+        )
+
+        self.requests.get(HEAT_URL + url,
+                          headers={'Content-Type': 'application/json'},
+                          json=resp_dict)
 
         event_list_text = self.shell('event-show {0} {1} {2}'.format(
                                      stack_id, resource_name,
@@ -2034,17 +1872,11 @@ class ShellTestResources(ShellBase):
                       "updated_time": "2014-01-06T16:14:26Z"}]}
         if with_resource_name:
             resp_dict["resources"][0]["resource_name"] = "aResource"
-        resp = fakes.FakeHTTPResponse(
-            200,
-            'OK',
-            {'content-type': 'application/json'},
-            jsonutils.dumps(resp_dict))
         stack_id = 'teststack/1'
-        http.HTTPClient.json_request(
-            'GET', '/stacks/%s/resources' % (
-                stack_id)).AndReturn((resp, resp_dict))
 
-        self.m.ReplayAll()
+        self.requests.get('%s/stacks/%s/resources' % (HEAT_URL, stack_id),
+                          headers={'Content-Type': 'application/json'},
+                          json=resp_dict)
 
         resource_list_text = self.shell('resource-list {0}'.format(stack_id))
 
@@ -2077,17 +1909,11 @@ class ShellTestResources(ShellBase):
     def test_resource_list_empty(self):
         self.register_keystone_auth_fixture()
         resp_dict = {"resources": []}
-        resp = fakes.FakeHTTPResponse(
-            200,
-            'OK',
-            {'content-type': 'application/json'},
-            jsonutils.dumps(resp_dict))
         stack_id = 'teststack/1'
-        http.HTTPClient.json_request(
-            'GET', '/stacks/%s/resources' % (
-                stack_id)).AndReturn((resp, resp_dict))
 
-        self.m.ReplayAll()
+        self.requests.get('%s/stacks/%s/resources' % (HEAT_URL, stack_id),
+                          headers={'Content-Type': 'application/json'},
+                          json=resp_dict)
 
         resource_list_text = self.shell('resource-list {0}'.format(stack_id))
 
@@ -2108,17 +1934,12 @@ class ShellTestResources(ShellBase):
             "resource_name": "foobar",
             "parent_resource": "my_parent_resource",
         }]}
-        resp = fakes.FakeHTTPResponse(
-            200,
-            'OK',
-            {'content-type': 'application/json'},
-            jsonutils.dumps(resp_dict))
         stack_id = 'teststack/1'
-        http.HTTPClient.json_request(
-            'GET', '/stacks/%s/resources?nested_depth=99' % (
-                stack_id)).AndReturn((resp, resp_dict))
 
-        self.m.ReplayAll()
+        url = '%s/stacks/%s/resources?nested_depth=99'
+        self.requests.get(url % (HEAT_URL, stack_id),
+                          headers={'Content-Type': 'application/json'},
+                          json=resp_dict)
 
         shell_cmd = 'resource-list {0} --nested-depth {1}'.format(stack_id, 99)
         resource_list_text = self.shell(shell_cmd)
@@ -2147,22 +1968,19 @@ class ShellTestResources(ShellBase):
                       "resource_status_reason": "state changed",
                       "resource_type": "OS::Nova::Server",
                       "updated_time": "2014-01-06T16:14:26Z"}}
-        resp = fakes.FakeHTTPResponse(
-            200,
-            'OK',
-            {'content-type': 'application/json'},
-            jsonutils.dumps(resp_dict))
+
         stack_id = 'teststack/1'
         resource_name = 'aResource'
-        http.HTTPClient.json_request(
-            'GET', '/stacks/%s/resources/%s' %
-            (
-                parse.quote(stack_id, ''),
-                parse.quote(encodeutils.safe_encode(
-                    resource_name), '')
-            )).AndReturn((resp, resp_dict))
 
-        self.m.ReplayAll()
+        url = '%s/stacks/%s/resources/%s' % (
+            HEAT_URL,
+            parse.quote(stack_id, ''),
+            parse.quote(encodeutils.safe_encode(resource_name), '')
+        )
+
+        self.requests.get(url,
+                          headers={'Content-Type': 'application/json'},
+                          json=resp_dict)
 
         resource_show_text = self.shell('resource-show {0} {1}'.format(
                                         stack_id, resource_name))
@@ -2192,47 +2010,38 @@ class ShellTestResources(ShellBase):
 
     def test_resource_signal(self):
         self.register_keystone_auth_fixture()
-        resp = fakes.FakeHTTPResponse(
-            200,
-            'OK',
-            {},
-            '')
+
         stack_id = 'teststack/1'
         resource_name = 'aResource'
-        http.HTTPClient.json_request(
-            'POST', '/stacks/%s/resources/%s/signal' %
-            (
-                parse.quote(stack_id, ''),
-                parse.quote(encodeutils.safe_encode(
-                    resource_name), '')
-            ),
-            data={'message': 'Content'}).AndReturn((resp, ''))
+        url = '%s/stacks/%s/resources/%s/signal' % (
+            HEAT_URL,
+            parse.quote(stack_id, ''),
+            parse.quote(encodeutils.safe_encode(resource_name), '')
+        )
 
-        self.m.ReplayAll()
+        self.requests.post(url,
+                           headers={'Content-Type': 'application/json'},
+                           json={})
 
         text = self.shell(
             'resource-signal {0} {1} -D {{"message":"Content"}}'.format(
                 stack_id, resource_name))
+
+        self.assertJsonEqual({'message': 'Content'},
+                             self.requests.last_request)
         self.assertEqual("", text)
 
     def test_resource_signal_no_data(self):
         self.register_keystone_auth_fixture()
-        resp = fakes.FakeHTTPResponse(
-            200,
-            'OK',
-            {},
-            '')
+
         stack_id = 'teststack/1'
         resource_name = 'aResource'
-        http.HTTPClient.json_request(
-            'POST', '/stacks/%s/resources/%s/signal' %
-            (
-                parse.quote(stack_id, ''),
-                parse.quote(encodeutils.safe_encode(
-                    resource_name), '')
-            ), data=None).AndReturn((resp, ''))
-
-        self.m.ReplayAll()
+        url = '%s/stacks/%s/resources/%s/signal' % (
+            HEAT_URL,
+            parse.quote(stack_id, ''),
+            parse.quote(encodeutils.safe_encode(resource_name), '')
+        )
+        self.requests.post(url, json={})
 
         text = self.shell(
             'resource-signal {0} {1}'.format(stack_id, resource_name))
@@ -2242,8 +2051,6 @@ class ShellTestResources(ShellBase):
         self.register_keystone_auth_fixture()
         stack_id = 'teststack/1'
         resource_name = 'aResource'
-
-        self.m.ReplayAll()
 
         error = self.assertRaises(
             exc.CommandError, self.shell,
@@ -2256,8 +2063,6 @@ class ShellTestResources(ShellBase):
         stack_id = 'teststack/1'
         resource_name = 'aResource'
 
-        self.m.ReplayAll()
-
         error = self.assertRaises(
             exc.CommandError, self.shell,
             'resource-signal {0} {1} -D "message"'.format(
@@ -2269,8 +2074,6 @@ class ShellTestResources(ShellBase):
         stack_id = 'teststack/1'
         resource_name = 'aResource'
 
-        self.m.ReplayAll()
-
         error = self.assertRaises(
             exc.CommandError, self.shell,
             'resource-signal {0} {1} -D "message" -f foo'.format(
@@ -2280,23 +2083,16 @@ class ShellTestResources(ShellBase):
 
     def test_resource_signal_data_file(self):
         self.register_keystone_auth_fixture()
-        resp = fakes.FakeHTTPResponse(
-            200,
-            'OK',
-            {},
-            '')
+
         stack_id = 'teststack/1'
         resource_name = 'aResource'
-        http.HTTPClient.json_request(
-            'POST', '/stacks/%s/resources/%s/signal' %
-            (
-                parse.quote(stack_id, ''),
-                parse.quote(encodeutils.safe_encode(
-                    resource_name), '')
-            ),
-            data={'message': 'Content'}).AndReturn((resp, ''))
+        url = '%s/stacks/%s/resources/%s/signal' % (
+            HEAT_URL,
+            parse.quote(stack_id, ''),
+            parse.quote(encodeutils.safe_encode(resource_name), '')
+        )
 
-        self.m.ReplayAll()
+        self.requests.post(url, json={})
 
         with tempfile.NamedTemporaryFile() as data_file:
             data_file.write(b'{"message":"Content"}')
@@ -2305,6 +2101,9 @@ class ShellTestResources(ShellBase):
                 'resource-signal {0} {1} -f {2}'.format(
                     stack_id, resource_name, data_file.name))
             self.assertEqual("", text)
+
+        self.assertJsonEqual({'message': 'Content'},
+                             self.requests.last_request)
 
 
 class ShellTestResourceTypes(ShellBase):
@@ -2318,17 +2117,11 @@ class ShellTestResourceTypes(ShellBase):
                      "parameters": {},
                      "resources": {},
                      "outputs": {}}
-        resp = fakes.FakeHTTPResponse(
-            200,
-            'OK',
-            {'content-type': 'application/json'},
-            jsonutils.dumps(resp_dict))
 
-        http.HTTPClient.json_request(
-            'GET', '/resource_types/OS%3A%3ANova%3A%3AKeyPair/template'
-        ).AndReturn((resp, resp_dict))
-
-        self.m.ReplayAll()
+        url = HEAT_URL + '/resource_types/OS%3A%3ANova%3A%3AKeyPair/template'
+        self.requests.get(url,
+                          headers={'Content-Type': 'application/json'},
+                          json=resp_dict)
 
         show_text = self.shell(
             'resource-type-template -F yaml OS::Nova::KeyPair')
@@ -2347,17 +2140,11 @@ class ShellTestResourceTypes(ShellBase):
                      "Parameters": {},
                      "Resources": {},
                      "Outputs": {}}
-        resp = fakes.FakeHTTPResponse(
-            200,
-            'OK',
-            {'content-type': 'application/json'},
-            jsonutils.dumps(resp_dict))
 
-        http.HTTPClient.json_request(
-            'GET', '/resource_types/OS%3A%3ANova%3A%3AKeyPair/template'
-        ).AndReturn((resp, resp_dict))
-
-        self.m.ReplayAll()
+        url = HEAT_URL + '/resource_types/OS%3A%3ANova%3A%3AKeyPair/template'
+        self.requests.get(url,
+                          headers={'Content-Type': 'application/json'},
+                          json=resp_dict)
 
         show_text = self.shell(
             'resource-type-template -F json OS::Nova::KeyPair')
@@ -2391,13 +2178,10 @@ class ShellTestBuildInfo(ShellBase):
                 'engine': {'revision': 'engine_revision'}
             }
         }
-        resp_string = jsonutils.dumps(resp_dict)
-        headers = {'content-type': 'application/json'}
-        http_resp = fakes.FakeHTTPResponse(200, 'OK', headers, resp_string)
-        response = (http_resp, resp_dict)
-        http.HTTPClient.json_request('GET', '/build_info').AndReturn(response)
 
-        self.m.ReplayAll()
+        self.requests.get('%s/build_info' % HEAT_URL,
+                          headers={'Content-Type': 'application/json'},
+                          json=resp_dict)
 
         build_info_text = self.shell('build-info')
 
@@ -2483,21 +2267,6 @@ class ShellTestStandaloneToken(ShellTestUserPass):
         """Check that we have sent the proper arguments to requests."""
         self.register_keystone_auth_fixture()
 
-        # we need a mock for 'request' to check whether proper arguments
-        # sent to request in the form of HTTP headers. So unset
-        # stubs(json_request, raw_request) and create a new mock for request.
-        self.m.UnsetStubs()
-        self.m.StubOutWithMock(requests, 'request')
-
-        # Record a 200
-        mock_conn = http.requests.request(
-            'GET', 'http://no.where/stacks?',
-            allow_redirects=False,
-            headers={'Content-Type': 'application/json',
-                     'Accept': 'application/json',
-                     'X-Auth-Token': self.token,
-                     'X-Auth-Url': BASE_URL,
-                     'User-Agent': 'python-heatclient'})
         resp_dict = {"stacks": [
             {
                 "id": "1",
@@ -2507,14 +2276,16 @@ class ShellTestStandaloneToken(ShellTestUserPass):
                 "stack_status": 'CREATE_COMPLETE',
                 "creation_time": "2014-10-15T01:58:47Z"
             }]}
-        mock_conn.AndReturn(
-            fakes.FakeHTTPResponse(
-                200, 'OK',
-                {'content-type': 'application/json'},
-                jsonutils.dumps(resp_dict)))
 
-        # Replay, create client, assert
-        self.m.ReplayAll()
+        self.requests.get('http://no.where/stacks?',
+                          request_headers={'Content-Type': 'application/json',
+                                           'Accept': 'application/json',
+                                           'X-Auth-Token': self.token,
+                                           'X-Auth-Url': BASE_URL,
+                                           'User-Agent': 'python-heatclient'},
+                          headers={'Content-Type': 'application/json'},
+                          json=resp_dict)
+
         list_text = self.shell('stack-list')
         required = [
             'id',
@@ -2533,8 +2304,6 @@ class MockShellBase(TestCase):
 
     def setUp(self):
         super(MockShellBase, self).setUp()
-        self.jreq_mock = self.patch(
-            'heatclient.common.http.HTTPClient.json_request')
 
         # Some tests set exc.verbose = 1, so reset on cleanup
         def unset_exc_verbose():
@@ -2571,7 +2340,29 @@ class MockShellTestUserPass(MockShellBase):
 
     def test_stack_list_with_args(self):
         self.register_keystone_auth_fixture()
-        self.jreq_mock.return_value = fakes.mock_script_heat_list()
+
+        resp_dict = {"stacks": [
+            {
+                "id": "1",
+                "stack_name": "teststack",
+                "stack_owner": "testowner",
+                "project": "testproject",
+                "stack_status": 'CREATE_COMPLETE',
+                "creation_time": "2012-10-25T01:58:47Z"
+            },
+            {
+                "id": "2",
+                "stack_name": "teststack2",
+                "stack_owner": "testowner",
+                "project": "testproject",
+                "stack_status": 'IN_PROGRESS',
+                "creation_time": "2012-10-25T01:58:47Z"
+            }]
+        }
+
+        m = self.requests.get('/stacks',
+                              headers={'Content-Type': 'application/json'},
+                              json=resp_dict)
 
         list_text = self.shell('stack-list'
                                ' --limit 2'
@@ -2592,17 +2383,13 @@ class MockShellTestUserPass(MockShellBase):
             self.assertRegexpMatches(list_text, r)
         self.assertNotRegexpMatches(list_text, 'parent')
 
-        self.assertEqual(1, self.jreq_mock.call_count)
-        method, url = self.jreq_mock.call_args[0]
-        self.assertEqual('GET', method)
-        base_url, query_params = utils.parse_query_url(url)
-        self.assertEqual('/stacks', base_url)
+        self.assertEqual(1, len(m.request_history))
         expected_query_dict = {'limit': ['2'],
-                               'status': ['COMPLETE', 'FAILED'],
+                               'status': ['complete', 'failed'],
                                'marker': ['fake_id'],
-                               'global_tenant': ['True'],
-                               'show_deleted': ['True']}
-        self.assertEqual(expected_query_dict, query_params)
+                               'global_tenant': ['true'],
+                               'show_deleted': ['true']}
+        self.assertEqual(expected_query_dict, self.requests.last_request.qs)
 
 
 class MockShellTestToken(MockShellTestUserPass):
@@ -2645,7 +2432,7 @@ class MockShellTestStandaloneToken(MockShellTestUserPass):
         fake_env = {
             'OS_AUTH_TOKEN': self.token,
             'OS_NO_CLIENT_AUTH': 'True',
-            'HEAT_URL': 'http://no.where',
+            'HEAT_URL': HEAT_URL,
             'OS_AUTH_URL': BASE_URL,
             # Note we also set username/password, because create/update
             # pass them even if we have a token to support storing credentials

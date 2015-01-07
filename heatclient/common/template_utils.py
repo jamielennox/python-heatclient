@@ -43,7 +43,7 @@ def get_template_contents(template_file=None, template_url=None,
     elif template_object:
         template_url = template_object
         tpl = object_request and object_request('GET',
-                                                template_object)
+                                                template_object).text
     else:
         raise exc.CommandError(_('Need to specify exactly one of '
                                '%(arg1)s, %(arg2)s or %(arg3)s') %
